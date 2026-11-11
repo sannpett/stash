@@ -1,0 +1,10 @@
+{
+  "description": "A social savings app where friends set goals, join challenges, track streaks, and compete on progress to make building better money habits more rewarding.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
