@@ -1,7 +1,8 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { Avatar, ConfirmDialog, Empty, Header, Icon, Progress, showToast } from "./components";
 import { ChallengeForm, GoalForm, Sheet, TransactionForm } from "./forms";
+import { isSupabaseConfigured, supabase } from "./supabase";
 import {
   AppState,
   Challenge,
@@ -1197,6 +1198,39 @@ export function Friends() {
   const [params, setParams] = useSearchParams();
   const view = params.get("view") ?? "activity";
   const [query, setQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<
+    Array<{ id: string; name: string; username: string; initials: string }>
+  >([]);
+  useEffect(() => {
+    if (view !== "add" || query.trim().length < 3) {
+      setSearchResults([]);
+      return;
+    }
+    let active = true;
+    void supabase?.rpc("search_profiles", { search_term: query.trim() }).then(({ data, error }) => {
+      if (!active) return;
+      if (error) {
+        setSearchResults([]);
+        return;
+      }
+      setSearchResults(
+        ((data ?? []) as Array<{
+          id: string;
+          username: string;
+          display_name: string;
+          initials: string;
+        }>).map((person) => ({
+          id: person.id,
+          name: person.display_name,
+          username: person.username,
+          initials: person.initials,
+        })),
+      );
+    });
+    return () => {
+      active = false;
+    };
+  }, [query, view]);
   const feed = state.feed.filter(
     (f) =>
       f.userId === "me" || state.people.some((p) => p.id === f.userId && p.status === "friend"),
@@ -1313,7 +1347,7 @@ export function Friends() {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search demo users by name or username"
+              placeholder="Search people by name or username"
               aria-label="Search users"
             />
           </div>
@@ -1322,24 +1356,72 @@ export function Friends() {
               <Icon name="share" />
             </span>
             <div>
-              <strong>Share your demo invite link</strong>
-              <p>Invite a friend to try the prototype</p>
+              <strong>Share your stash profile</strong>
+              <p>Friends can find you by username</p>
             </div>
             <button
               onClick={() => {
-                navigator.clipboard?.writeText("https://stash.demo/invite/alex");
-                showToast("Invite link copied.");
+                navigator.clipboard?.writeText(`stash: profile / @${state.profile.username}`);
+                showToast("Profile link copied.");
               }}
             >
               Copy
             </button>
           </div>
-          <h3>Demo users</h3>
-          {state.people
-            .filter((p) => `${p.name} ${p.username}`.toLowerCase().includes(query.toLowerCase()))
-            .map((p) => (
-              <FriendRow id={p.id} key={p.id} />
-            ))}
+          <h3>Find people</h3>
+          {query.trim().length < 3 ? (
+            <p className="muted small">Enter at least 3 characters to search.</p>
+          ) : searchResults.length ? (
+            searchResults.map((person) => {
+              const existing = state.people.find((item) => item.id === person.id);
+              return (
+                <div className="friend-row" key={person.id}>
+                  <Avatar initials={person.initials} color="green" size="lg" />
+                  <div>
+                    <strong>{person.name}</strong>
+                    <span>@{person.username}</span>
+                  </div>
+                  {existing?.status === "friend" ? (
+                    <Link className="row-chevron" to={`/friends/${person.id}`}>
+                      <Icon name="chevron" />
+                    </Link>
+                  ) : existing?.status === "outgoing" ? (
+                    <button
+                      className="sent"
+                      onClick={() => dispatch({ type: "FRIEND_STATUS", id: person.id, status: "none" })}
+                    >
+                      Cancel
+                    </button>
+                  ) : (
+                    <button
+                      onClick={() => {
+                        dispatch({
+                          type: "PERSON_ADD",
+                          person: {
+                            id: person.id,
+                            name: person.name,
+                            username: person.username,
+                            initials: person.initials,
+                            color: "green",
+                            status: "none",
+                            progress: 0,
+                            streak: 0,
+                            xp: 0,
+                          },
+                        });
+                        dispatch({ type: "FRIEND_STATUS", id: person.id, status: "outgoing" });
+                        showToast("Friend request sent.");
+                      }}
+                    >
+                      Add
+                    </button>
+                  )}
+                </div>
+              );
+            })
+          ) : (
+            <p className="muted small">No people found.</p>
+          )}
         </section>
       )}
       <div className="privacy-note">
@@ -1432,7 +1514,7 @@ export function FriendProfile() {
       <section className="profile-hero">
         <Avatar initials={person.initials} color={person.color} size="xl" online />
         <h2>{person.name}</h2>
-        <p>@{person.username} · Demo account</p>
+        <p>@{person.username}</p>
         <div className="level-pill">
           <Icon name="bolt" size={15} />
           Level {levelFromXp(person.xp)} · {person.progress}% momentum
@@ -1728,6 +1810,15 @@ export function Settings() {
     dispatch({ type: "SETTINGS_UPDATE", settings: { [key]: value } });
     showToast("Preference saved.");
   };
+  const signOut = async () => {
+    if (!supabase) return;
+    const { error } = await supabase.auth.signOut();
+    if (error) {
+      showToast(`Couldn't sign out: ${error.message}`, "error");
+      return;
+    }
+    showToast("Signed out.");
+  };
   return (
     <main className="screen">
       <Header title="Settings" subtitle="Account and preferences" back />
@@ -1745,6 +1836,18 @@ export function Settings() {
           </div>
           <Icon name="chevron" />
         </button>
+        {isSupabaseConfigured && (
+          <button onClick={() => void signOut()}>
+            <span className="setting-icon">
+              <Icon name="x" />
+            </span>
+            <div>
+              <strong>Sign out</strong>
+              <small>Sign out of this account on this device</small>
+            </div>
+            <Icon name="chevron" />
+          </button>
+        )}
       </section>
       <section className="settings-group">
         <h2>Privacy</h2>
@@ -1837,10 +1940,10 @@ export function Settings() {
             const url = URL.createObjectURL(blob);
             const a = document.createElement("a");
             a.href = url;
-            a.download = "stash-demo-data.json";
+            a.download = isSupabaseConfigured ? "stash-data.json" : "stash-demo-data.json";
             a.click();
             URL.revokeObjectURL(url);
-            showToast("Demo data exported.");
+            showToast(isSupabaseConfigured ? "Account data exported." : "Demo data exported.");
           }}
         >
           <span className="setting-icon">
@@ -1852,16 +1955,18 @@ export function Settings() {
           </div>
           <Icon name="chevron" />
         </button>
-        <button onClick={() => setReset(true)}>
-          <span className="setting-icon danger">
-            <Icon name="trash" />
-          </span>
-          <div>
-            <strong>Reset prototype data</strong>
-            <small>Restore the original sample state</small>
-          </div>
-          <Icon name="chevron" />
-        </button>
+        {!isSupabaseConfigured && (
+          <button onClick={() => setReset(true)}>
+            <span className="setting-icon danger">
+              <Icon name="trash" />
+            </span>
+            <div>
+              <strong>Reset prototype data</strong>
+              <small>Restore the original sample state</small>
+            </div>
+            <Icon name="chevron" />
+          </button>
+        )}
       </section>
       {editing && <ProfileForm onClose={() => setEditing(false)} />}{" "}
       {reset && (

@@ -1,11 +1,11 @@
 import { RouterProvider } from "react-router";
-import { StoreProvider } from "./store";
+import { AuthGate } from "./AuthGate";
 import { router } from "./routes";
 
 export default function App() {
   return (
-    <StoreProvider>
+    <AuthGate>
       <RouterProvider router={router} />
-    </StoreProvider>
+    </AuthGate>
   );
 }

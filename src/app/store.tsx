@@ -1,4 +1,14 @@
-import { createContext, useContext, useEffect, useMemo, useReducer } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
+import { requireSupabase } from "./supabase";
 
 export type GoalStatus = "active" | "paused" | "completed";
 export type Goal = {
@@ -108,8 +118,8 @@ export type AppState = {
 const DAY = 86_400_000;
 const iso = (offset = 0) => new Date(Date.now() + offset * DAY).toISOString().slice(0, 10);
 const stamp = (offset = 0) => new Date(Date.now() + offset * DAY).toISOString();
-export const uid = (prefix: string) =>
-  `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+export const uid = (_prefix: string) =>
+  crypto.randomUUID();
 
 export const seedState: AppState = {
   version: 2,
@@ -537,6 +547,8 @@ export const personFor = (state: AppState, id: string) =>
     : state.people.find((p) => p.id === id);
 
 export type Action =
+  | { type: "HYDRATE"; state: AppState }
+  | { type: "PERSON_ADD"; person: Person }
   | { type: "TRANSACTION_ADD"; transaction: Transaction }
   | { type: "TRANSACTION_UPDATE"; transaction: Transaction }
   | { type: "TRANSACTION_DELETE"; id: string }
@@ -581,6 +593,15 @@ const feedItem = (text: string, target?: string): FeedItem => ({
 });
 export function appReducer(state: AppState, action: Action): AppState {
   switch (action.type) {
+    case "HYDRATE":
+      return action.state;
+    case "PERSON_ADD":
+      return {
+        ...state,
+        people: state.people.some((person) => person.id === action.person.id)
+          ? state.people.map((person) => (person.id === action.person.id ? action.person : person))
+          : [action.person, ...state.people],
+      };
     case "TRANSACTION_ADD": {
       const gain = action.transaction.kind === "contribution";
       const goal = state.goals.find((g) => g.id === action.transaction.goalId);
@@ -955,8 +976,470 @@ export function appReducer(state: AppState, action: Action): AppState {
 type StoreValue = { state: AppState; dispatch: React.Dispatch<Action> };
 const Store = createContext<StoreValue | null>(null);
 const STORAGE_KEY = "stashup-state-v2";
-export function StoreProvider({ children }: { children: React.ReactNode }) {
-  const [state, dispatch] = useReducer(appReducer, seedState, (seed) => {
+type StoreProviderProps = { children: React.ReactNode; userId?: string };
+type ProfileRow = {
+  id: string;
+  username: string;
+  display_name: string;
+  initials: string;
+  city: string;
+  bio: string;
+  avatar_path: string | null;
+  banner_path: string | null;
+  currency: string;
+  private_progress: boolean;
+  friend_activity: boolean;
+  challenge_alerts: boolean;
+  milestone_alerts: boolean;
+  reduced_motion: boolean;
+  theme: "light" | "dark";
+  xp: number;
+  earned_badges: string[];
+};
+type GoalRow = {
+  id: string;
+  name: string;
+  target_amount_cents: number;
+  deadline: string | null;
+  status: GoalStatus;
+  color: string;
+  created_at: string;
+};
+type EntryRow = {
+  id: string;
+  goal_id: string;
+  amount_cents: number;
+  kind: Transaction["kind"];
+  category: string;
+  description: string;
+  occurred_on: string;
+  created_at: string;
+};
+type FriendshipRow = {
+  id: string;
+  requester_id: string;
+  addressee_id: string;
+  status: "pending" | "accepted" | "declined" | "cancelled";
+  profiles?: ProfileRow;
+};
+type ChallengeRow = {
+  id: string;
+  creator_id: string;
+  title: string;
+  description: string;
+  type: ChallengeType;
+  target_amount_cents: number;
+  starts_on: string;
+  ends_on: string;
+  status: "upcoming" | "active" | "completed";
+};
+type ParticipantRow = {
+  challenge_id: string;
+  user_id: string;
+  status: "invited" | "active" | "declined" | "left";
+  progress_percent: number;
+};
+
+async function loadAccountState(userId: string): Promise<AppState> {
+  const client = requireSupabase();
+  const [profileResult, goalsResult, entriesResult, friendshipsResult, challengesResult] =
+    await Promise.all([
+    client.from("profiles").select("*").eq("id", userId).single(),
+    client.from("savings_goals").select("*").eq("user_id", userId).order("created_at"),
+    client
+      .from("savings_entries")
+      .select("*")
+      .eq("user_id", userId)
+      .order("occurred_on", { ascending: false }),
+    client
+      .from("friendships")
+      .select("*")
+      .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`),
+    client
+      .from("challenges")
+      .select("*")
+      .or(`creator_id.eq.${userId},visibility.eq.public`)
+  ]);
+  if (profileResult.error) throw profileResult.error;
+  if (goalsResult.error) throw goalsResult.error;
+  if (entriesResult.error) throw entriesResult.error;
+  if (friendshipsResult.error) throw friendshipsResult.error;
+  if (challengesResult.error) throw challengesResult.error;
+
+  const profile = profileResult.data as ProfileRow;
+  const goals = (goalsResult.data ?? []) as GoalRow[];
+  const entries = (entriesResult.data ?? []) as EntryRow[];
+  const friendships = (friendshipsResult.data ?? []) as FriendshipRow[];
+  const challenges = (challengesResult.data ?? []) as ChallengeRow[];
+
+  const relatedUserIds = [
+    ...new Set(
+      friendships.map((friendship) =>
+        friendship.requester_id === userId ? friendship.addressee_id : friendship.requester_id,
+      ),
+    ),
+  ];
+  const challengeIds = challenges.map((challenge) => challenge.id);
+  const [peopleResult, participantResult] = await Promise.all([
+    relatedUserIds.length
+      ? client
+          .from("profiles")
+          .select("id, username, display_name, initials, city, xp")
+          .in("id", relatedUserIds)
+      : Promise.resolve({ data: [], error: null }),
+    challengeIds.length
+      ? client
+          .from("challenge_participants")
+          .select("challenge_id, user_id, status, progress_percent")
+          .in("challenge_id", challengeIds)
+          .in("status", ["invited", "active"])
+      : Promise.resolve({ data: [], error: null }),
+  ]);
+  if (peopleResult.error) throw peopleResult.error;
+  if (participantResult.error) throw participantResult.error;
+
+  const peopleById = new Map(
+    ((peopleResult.data ?? []) as Array<{
+      id: string;
+      username: string;
+      display_name: string;
+      initials: string;
+      xp: number;
+    }>).map((person) => [person.id, person]),
+  );
+  const people: Person[] = friendships
+    .filter((friendship) => friendship.status !== "cancelled" && friendship.status !== "declined")
+    .map((friendship) => {
+      const personId =
+        friendship.requester_id === userId ? friendship.addressee_id : friendship.requester_id;
+      const person = peopleById.get(personId);
+      let status: FriendStatus = "none";
+      if (friendship.status === "accepted") status = "friend";
+      else if (friendship.requester_id === userId) status = "outgoing";
+      else status = "incoming";
+      return {
+        id: personId,
+        name: person?.display_name ?? "Stash user",
+        username: person?.username ?? "stash_user",
+        initials: person?.initials ?? "SU",
+        color: "green",
+        status,
+        progress: 0,
+        streak: 0,
+        xp: person?.xp ?? 0,
+      };
+    });
+
+  const participants = (participantResult.data ?? []) as ParticipantRow[];
+  const cloudChallenges: Challenge[] = challenges.map((challenge) => ({
+    id: challenge.id,
+    title: challenge.title,
+    description: challenge.description,
+    type: challenge.type,
+    target: Number(challenge.target_amount_cents) / 100,
+    startDate: challenge.starts_on,
+    endDate: challenge.ends_on,
+    status: challenge.status,
+    creatorId: challenge.creator_id,
+    participants: participants
+      .filter((participant) => participant.challenge_id === challenge.id)
+      .map((participant) => ({
+        userId: participant.user_id === userId ? "me" : participant.user_id,
+        progress: Number(participant.progress_percent),
+      })),
+    invitedIds: participants
+      .filter(
+        (participant) =>
+          participant.challenge_id === challenge.id && participant.status === "invited",
+      )
+      .map((participant) => (participant.user_id === userId ? "me" : participant.user_id)),
+  }));
+  if (cloudChallenges.length) {
+    cloudChallenges.forEach((challenge) => {
+      if (!challenge.participants.some((participant) => participant.userId === "me")) {
+        challenge.participants = challenge.participants.map((participant) => ({
+          ...participant,
+          progress: participant.progress,
+        }));
+      }
+    });
+  }
+  return {
+    ...seedState,
+    profile: {
+      id: "me",
+      name: profile.display_name,
+      username: profile.username,
+      initials: profile.initials,
+      city: profile.city,
+      avatar: profile.avatar_path ?? undefined,
+      banner: profile.banner_path ?? undefined,
+      bio: profile.bio,
+      xp: profile.xp,
+      earnedBadges: profile.earned_badges,
+    },
+    goals: goals.map((goal) => ({
+      id: goal.id,
+      name: goal.name,
+      target: Number(goal.target_amount_cents) / 100,
+      deadline: goal.deadline ?? new Date().toISOString().slice(0, 10),
+      status: goal.status,
+      color: goal.color,
+      createdAt: goal.created_at,
+    })),
+    transactions: entries.map((entry) => ({
+      id: entry.id,
+      goalId: entry.goal_id,
+      amount: Number(entry.amount_cents) / 100,
+      kind: entry.kind,
+      category: entry.category,
+      description: entry.description,
+      date: entry.occurred_on,
+      createdAt: entry.created_at,
+    })),
+    challenges: cloudChallenges,
+    people,
+    feed: [],
+    notifications: [],
+    settings: {
+      privateProgress: profile.private_progress,
+      friendActivity: profile.friend_activity,
+      challengeAlerts: profile.challenge_alerts,
+      milestoneAlerts: profile.milestone_alerts,
+      currency: profile.currency,
+      reducedMotion: profile.reduced_motion,
+      theme: profile.theme,
+    },
+    awarded: [],
+  };
+}
+
+async function persistAccountAction(action: Action, state: AppState, userId: string) {
+  const client = requireSupabase();
+  const saveProfile = async () => {
+    const { error } = await client
+      .from("profiles")
+      .update({
+        username: state.profile.username,
+        display_name: state.profile.name,
+        initials: state.profile.initials,
+        city: state.profile.city,
+        bio: state.profile.bio ?? "",
+        avatar_path: state.profile.avatar ?? null,
+        banner_path: state.profile.banner ?? null,
+        currency: state.settings.currency,
+        private_progress: state.settings.privateProgress,
+        friend_activity: state.settings.friendActivity,
+        challenge_alerts: state.settings.challengeAlerts,
+        milestone_alerts: state.settings.milestoneAlerts,
+        reduced_motion: state.settings.reducedMotion,
+        theme: state.settings.theme,
+        xp: state.profile.xp,
+        earned_badges: state.profile.earnedBadges,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", userId);
+    if (error) throw error;
+  };
+  if (action.type === "GOAL_ADD" || action.type === "GOAL_UPDATE") {
+    const goal = action.goal;
+    const { error } = await client.from("savings_goals").upsert(
+      {
+        id: goal.id,
+        user_id: userId,
+        name: goal.name,
+        target_amount_cents: Math.round(goal.target * 100),
+        deadline: goal.deadline || null,
+        status: goal.status,
+        color: goal.color,
+        created_at: goal.createdAt,
+      },
+      { onConflict: "id" },
+    );
+    if (error) throw error;
+  } else if (action.type === "GOAL_DELETE") {
+    const { error } = await client
+      .from("savings_goals")
+      .delete()
+      .eq("id", action.id)
+      .eq("user_id", userId);
+    if (error) throw error;
+  } else if (action.type === "TRANSACTION_ADD" || action.type === "TRANSACTION_UPDATE") {
+    const entry = action.transaction;
+    const { error } = await client.from("savings_entries").upsert(
+      {
+        id: entry.id,
+        user_id: userId,
+        goal_id: entry.goalId,
+        amount_cents: Math.round(entry.amount * 100),
+        kind: entry.kind,
+        category: entry.category,
+        description: entry.description,
+        occurred_on: entry.date,
+        created_at: entry.createdAt,
+      },
+      { onConflict: "id" },
+    );
+    if (error) throw error;
+  } else if (action.type === "TRANSACTION_DELETE") {
+    const { error } = await client
+      .from("savings_entries")
+      .delete()
+      .eq("id", action.id)
+      .eq("user_id", userId);
+    if (error) throw error;
+  } else if (action.type === "FRIEND_STATUS") {
+    const person = state.people.find((item) => item.id === action.id);
+    const existing = await client
+      .from("friendships")
+      .select("id, requester_id, addressee_id")
+      .or(`and(requester_id.eq.${userId},addressee_id.eq.${action.id}),and(requester_id.eq.${action.id},addressee_id.eq.${userId})`)
+      .maybeSingle();
+    if (existing.error) throw existing.error;
+    if (action.status === "outgoing") {
+      if (existing.data) throw new Error("A friendship request already exists.");
+      const { error } = await client.from("friendships").insert({
+        requester_id: userId,
+        addressee_id: action.id,
+        status: "pending",
+      });
+      if (error) throw error;
+    } else if (action.status === "friend") {
+      if (!existing.data) throw new Error("That friend request no longer exists.");
+      const { error } = await client
+        .from("friendships")
+        .update({ status: "accepted", updated_at: new Date().toISOString() })
+        .eq("id", existing.data.id)
+        .eq("addressee_id", userId);
+      if (error) throw error;
+    } else if (action.status === "none") {
+      if (!existing.data) throw new Error("That friendship no longer exists.");
+      const row = existing.data;
+      if (row.requester_id === userId) {
+        const { error } = await client
+          .from("friendships")
+          .update({ status: "cancelled", updated_at: new Date().toISOString() })
+          .eq("id", row.id)
+          .eq("requester_id", userId);
+        if (error) throw error;
+      } else {
+        const { error } = await client
+          .from("friendships")
+          .delete()
+          .eq("id", row.id)
+          .or(`requester_id.eq.${userId},addressee_id.eq.${userId}`);
+        if (error) throw error;
+      }
+    }
+    if (person) void person;
+  } else if (
+    action.type === "CHALLENGE_ADD" ||
+    action.type === "CHALLENGE_UPDATE"
+  ) {
+    const challenge = action.challenge;
+    const { error } = await client.from("challenges").upsert(
+      {
+        id: challenge.id,
+        creator_id: userId,
+        title: challenge.title,
+        description: challenge.description,
+        type: challenge.type,
+        target_amount_cents: Math.round(challenge.target * 100),
+        starts_on: challenge.startDate,
+        ends_on: challenge.endDate,
+        status: challenge.status,
+        visibility: "invite_only",
+      },
+      { onConflict: "id" },
+    );
+    if (error) throw error;
+    if (action.type === "CHALLENGE_ADD") {
+      const { error: participantError } = await client
+        .from("challenge_participants")
+        .upsert(
+          {
+            challenge_id: challenge.id,
+            user_id: userId,
+            status: "active",
+            progress_percent: 0,
+          },
+          { onConflict: "challenge_id,user_id" },
+        );
+      if (participantError) throw participantError;
+    }
+  } else if (
+    action.type === "CHALLENGE_JOIN" ||
+    action.type === "CHALLENGE_INVITE_DECLINE"
+  ) {
+    if (action.type === "CHALLENGE_JOIN") {
+      const { error } = await client.from("challenge_participants").upsert(
+        {
+          challenge_id: action.id,
+          user_id: userId,
+          status: "active",
+          progress_percent: 0,
+        },
+        { onConflict: "challenge_id,user_id" },
+      );
+      if (error) throw error;
+    } else {
+      const { error } = await client
+        .from("challenge_participants")
+        .update({ status: "declined" })
+        .eq("challenge_id", action.id)
+        .eq("user_id", userId);
+      if (error) throw error;
+    }
+  } else if (action.type === "CHALLENGE_LEAVE") {
+    const { error } = await client
+      .from("challenge_participants")
+      .delete()
+      .eq("challenge_id", action.id)
+      .eq("user_id", userId);
+    if (error) throw error;
+  } else if (action.type === "CHALLENGE_INVITE") {
+    const { error } = await client.from("challenge_participants").upsert(
+      {
+        challenge_id: action.id,
+        user_id: action.userId,
+        status: "invited",
+        progress_percent: 0,
+      },
+      { onConflict: "challenge_id,user_id" },
+    );
+    if (error) throw error;
+  } else if (action.type === "CHALLENGE_PROGRESS") {
+    const challenge = state.challenges.find((item) => item.id === action.id);
+    const participant = challenge?.participants.find((item) => item.userId === "me");
+    const { error } = await client
+      .from("challenge_participants")
+      .update({ progress_percent: participant?.progress ?? 0 })
+      .eq("challenge_id", action.id)
+      .eq("user_id", userId);
+    if (error) throw error;
+  } else if (action.type === "CHALLENGE_COMPLETE") {
+    const challenge = state.challenges.find((item) => item.id === action.id);
+    if (challenge) {
+      const { error: challengeError } = await client
+        .from("challenges")
+        .update({ status: "completed" })
+        .eq("id", action.id)
+        .eq("creator_id", userId);
+      if (challengeError) throw challengeError;
+    }
+  }
+  if (
+    action.type.startsWith("GOAL_") ||
+    action.type.startsWith("TRANSACTION_") ||
+    action.type === "PROFILE_UPDATE" ||
+    action.type === "SETTINGS_UPDATE"
+  ) {
+    await saveProfile();
+  }
+}
+
+export function StoreProvider({ children, userId }: StoreProviderProps) {
+  const [state, reducerDispatch] = useReducer(appReducer, seedState, (seed) => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (!saved) return seed;
@@ -970,10 +1453,80 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return seed;
     }
   });
+  const stateRef = useRef(state);
+  const [ready, setReady] = useState(!userId);
+  const [loadError, setLoadError] = useState("");
+
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  }, [state]);
-  const value = useMemo(() => ({ state, dispatch }), [state]);
+    if (!userId) {
+      setReady(true);
+      setLoadError("");
+      return;
+    }
+    let active = true;
+    setReady(false);
+    setLoadError("");
+    void loadAccountState(userId)
+      .then((accountState) => {
+        if (!active) return;
+        stateRef.current = accountState;
+        reducerDispatch({ type: "HYDRATE", state: accountState });
+        setReady(true);
+      })
+      .catch((error: unknown) => {
+        if (!active) return;
+        setLoadError(error instanceof Error ? error.message : "Could not load your account data.");
+        setReady(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [userId]);
+
+  useEffect(() => {
+    stateRef.current = state;
+    if (!userId) localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  }, [state, userId]);
+
+  const dispatch = useCallback<React.Dispatch<Action>>(
+    (action) => {
+      if (action.type === "HYDRATE") {
+        stateRef.current = action.state;
+        reducerDispatch(action);
+        return;
+      }
+      const nextState = appReducer(stateRef.current, action);
+      if (nextState === stateRef.current) return;
+      stateRef.current = nextState;
+      reducerDispatch(action);
+      if (userId) {
+        void persistAccountAction(action, nextState, userId).catch((error: unknown) => {
+          window.dispatchEvent(
+            new CustomEvent("stashup-toast", {
+              detail: {
+                message:
+                  error instanceof Error ? `Couldn't sync changes: ${error.message}` : "Couldn't sync changes.",
+                type: "error",
+              },
+            }),
+          );
+        });
+      }
+    },
+    [userId],
+  );
+  const value = useMemo(() => ({ state, dispatch }), [state, dispatch]);
+  if (userId && !ready) return <div className="app-loading">Loading your stash…</div>;
+  if (userId && loadError)
+    return (
+      <div className="app-loading" role="alert">
+        <p>Couldn’t load your account data.</p>
+        <p>{loadError}</p>
+        <button className="secondary" onClick={() => window.location.reload()}>
+          Try again
+        </button>
+      </div>
+    );
   return <Store.Provider value={value}>{children}</Store.Provider>;
 }
 export function useStore() {
