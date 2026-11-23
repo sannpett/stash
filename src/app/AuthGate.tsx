@@ -5,6 +5,8 @@ import { isSupabaseConfigured, supabase } from "./supabase";
 
 type AuthMode = "sign-in" | "sign-up" | "recovery";
 
+const authRedirectUrl = () => new URL(import.meta.env.BASE_URL, window.location.origin).toString();
+
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(isSupabaseConfigured);
@@ -62,14 +64,14 @@ function AuthScreen({ initialError = "" }: { initialError?: string }) {
           password,
           options: {
             data: { display_name: name.trim(), username: username.trim().toLowerCase() },
-            emailRedirectTo: window.location.origin,
+            emailRedirectTo: authRedirectUrl(),
           },
         });
         if (authError) throw authError;
         if (!data.session) setMessage("Check your email to confirm your account, then sign in.");
       } else if (mode === "recovery") {
         const { error: authError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
-          redirectTo: window.location.origin,
+          redirectTo: authRedirectUrl(),
         });
         if (authError) throw authError;
         setMessage("If an account exists for that email, a password reset link is on its way.");
